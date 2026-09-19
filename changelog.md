@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Known Issues]
 - None. Please feel free to submit an issue via [GitHub](https://github.com/ryanblenis/MeshCentral-EventLog) if you find anything.
 
+## [0.1.13] - 2026-09-19
+### Fixed
+- **The event table now always fits the browser window.** Its height is measured against the window instead of a fixed estimate, and is re-fitted when the window is resized, so the details pane and the status line (with "Reset height") can no longer be pushed out of view
+  - A height set by dragging the grip is kept as a preference but never grows past the window; dragging stops at the window edge. Enlarging the window restores the chosen height
+  - Viewer layout: the Log/Source sidebar scrolls on its own instead of stretching the layout, and a very long event message scrolls inside the details pane (max. 40% of the window height)
+
 ## [0.1.12] - 2026-09-01
 ### Added
 - **Config sets can now include or exclude by Category and by Source**, for Live and History separately. Each list has an Include/Exclude switch; empty lists mean no filter

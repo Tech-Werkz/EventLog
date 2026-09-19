@@ -93,6 +93,8 @@ module.exports.eventlog = function (parent) {
       'elRzFit',
       'elGripDown',
       'elGripReset',
+      'elFitAvail',
+      'elFitHeight',
       'elResetSizes',
       'elVSplitDown',
       'elVSplitReset',
@@ -490,7 +492,7 @@ body.night #pluginEventLog {
 #pluginEventLog .evlStatus .live { color:var(--evl-ok); }
 #pluginEventLog .evlStatus .warn { color:var(--evl-warn); }
 #pluginEventLog .evlViewer { display:grid; grid-template-columns:var(--evl-side, 215px) 7px minmax(0, 1fr); border:1px solid var(--evl-line); border-radius:3px; overflow:hidden; }
-#pluginEventLog .evlFacets { padding:9px 11px; background:var(--evl-alt); min-width:0; overflow:hidden; }
+#pluginEventLog .evlFacets { padding:9px 11px; background:var(--evl-alt); min-width:0; overflow-x:hidden; overflow-y:auto; contain:size; }
 #pluginEventLog .evlVSplit { cursor:col-resize; background:var(--evl-alt); border-right:1px solid var(--evl-line); position:relative; touch-action:none; user-select:none; }
 #pluginEventLog .evlVSplit::after { content:""; position:absolute; top:50%; left:2px; height:34px; width:1px; margin-top:-17px; background:var(--evl-line); box-shadow:2px 0 0 var(--evl-line); }
 #pluginEventLog .evlVSplit:hover, #pluginEventLog .evlVSplit.active { background:var(--evl-sel); }
@@ -506,7 +508,7 @@ body.night #pluginEventLog {
 #pluginEventLog .evlScroll { overflow:auto; max-height:calc(100vh - 270px); min-height:160px; position:relative; }
 #pluginEventLog .evlVList { overflow:auto; max-height:max(200px, calc(100vh - 520px)); outline:none; position:relative; }
 #pluginEventLog .evlVList table.evlLog th { top:0; }
-#pluginEventLog .evlDetails { border-top:1px solid var(--evl-line); }
+#pluginEventLog .evlDetails { border-top:1px solid var(--evl-line); max-height:40vh; overflow:auto; }
 #pluginEventLog .evlDTabs { display:flex; align-items:center; border-bottom:1px solid var(--evl-line); background:var(--evl-alt); }
 #pluginEventLog .evlDTabs button { border:0; background:none; color:var(--evl-muted); padding:6px 14px; cursor:pointer; font:inherit; }
 #pluginEventLog .evlDTabs button.on { color:var(--evl-ink); font-weight:bold; border-bottom:2px solid var(--evl-acc); margin-bottom:-1px; }
@@ -518,7 +520,7 @@ body.night #pluginEventLog {
 @media (max-width: 1000px) {
   #pluginEventLog .evlViewer { grid-template-columns:1fr; }
   #pluginEventLog .evlVSplit { display:none; }
-  #pluginEventLog .evlFacets { border-bottom:1px solid var(--evl-line); }
+  #pluginEventLog .evlFacets { border-bottom:1px solid var(--evl-line); contain:none; max-height:30vh; }
   #pluginEventLog .evlDBody { grid-template-columns:1fr; }
 }
 `;
@@ -536,6 +538,8 @@ body.night #pluginEventLog {
             QH('pluginEventLog', '<div id=evlWrap><div id=evlToolbar></div><div id=evlChips class=evlChips></div><div id=evlBody></div><div id=evlStatus class=evlStatus></div></div>');
             ph.elRenderShell();
         }
+        ph.elFitHeight();   // the tab may have been hidden during the last render
+        if (!ph._fitBound) { ph._fitBound = true; window.addEventListener('resize', function() { pluginHandler.eventlog.elFitHeight(); }); }
         return true;
     };
 
@@ -727,6 +731,7 @@ body.night #pluginEventLog {
             h += '<div class=evlGrip title="Drag to change the table height &middot; double-click to reset" onpointerdown="return pluginHandler.eventlog.elGripDown(event,\'evlScroll\')" ondblclick="return pluginHandler.eventlog.elGripReset()"></div>';
         }
         QH('evlBody', h);
+        ph.elFitHeight();
     };
 
     obj.elEmptyText = function() {
@@ -794,6 +799,7 @@ body.night #pluginEventLog {
         if (st.layout == 'viewer' && st.sideW) parts.push('sidebar width');
         if (parts.length) h += '<span class=evlLink title="Back to the automatic sizes" onclick="return pluginHandler.eventlog.elResetSizes()">Reset ' + (parts.length > 2 ? 'sizes' : parts.join(' &amp; ')) + '</span>';
         QH('evlStatus', h);
+        ph.elFitHeight();
     };
 
     // ---- interactions ----
@@ -1009,8 +1015,8 @@ body.night #pluginEventLog {
         ev.preventDefault();
         try { g.setPointerCapture(ev.pointerId); } catch (e) { }
         g.classList.add('active');
-        var y0 = ev.clientY, h0 = t.getBoundingClientRect().height, hh = 0;
-        var mv = function(e) { hh = Math.max(90, Math.round(h0 + e.clientY - y0)); t.style.height = hh + 'px'; t.style.maxHeight = 'none'; t.style.minHeight = '0'; };
+        var y0 = ev.clientY, h0 = t.getBoundingClientRect().height, hh = 0, cap = ph.elFitAvail() || 1e6;
+        var mv = function(e) { hh = Math.min(cap, Math.max(90, Math.round(h0 + e.clientY - y0))); t.style.height = hh + 'px'; t.style.maxHeight = 'none'; t.style.minHeight = '0'; };
         var up = function() {
             g.removeEventListener('pointermove', mv); g.removeEventListener('pointerup', up); g.removeEventListener('pointercancel', up);
             g.classList.remove('active');
@@ -1018,6 +1024,32 @@ body.night #pluginEventLog {
         };
         g.addEventListener('pointermove', mv); g.addEventListener('pointerup', up); g.addEventListener('pointercancel', up);
         return false;
+    };
+    // Height (px) the table can take so that everything below it (details, status line) still fits in the
+    // window. 0 = unknown (tab hidden).
+    obj.elFitAvail = function() {
+        var ph = pluginHandler.eventlog, st = ph.elState();
+        var t = Q(st.layout == 'viewer' ? 'evlVList' : 'evlScroll'), wrap = Q('evlWrap');
+        if (!t || !wrap || !t.offsetParent) return 0;
+        var r = t.getBoundingClientRect(), top = r.top, bottom = window.innerHeight, sc = null;
+        for (var p = wrap.parentNode; p && p.nodeType == 1 && p != document.body && p != document.documentElement; p = p.parentNode) {
+            var oy = getComputedStyle(p).overflowY;
+            if (oy == 'auto' || oy == 'scroll') { sc = p; break; }
+        }
+        // measure from where the table sits when the page is scrolled to the top
+        if (sc) { top += sc.scrollTop; bottom = Math.min(bottom, sc.getBoundingClientRect().bottom); }
+        else top += (window.pageYOffset || 0);
+        var below = wrap.getBoundingClientRect().bottom - r.bottom;
+        return Math.max(90, Math.floor(bottom - top - below - 6));
+    };
+    // Automatic height fills the window; a user-dragged height is kept but never grows past it.
+    obj.elFitHeight = function() {
+        var ph = pluginHandler.eventlog, st = ph.elState();
+        var t = Q(st.layout == 'viewer' ? 'evlVList' : 'evlScroll'), avail = ph.elFitAvail();
+        if (!t || !avail) return;
+        var uh = st.heights[st.layout];
+        if (uh) { t.style.height = Math.min(uh, avail) + 'px'; t.style.maxHeight = 'none'; t.style.minHeight = '0'; }
+        else { t.style.height = ''; t.style.maxHeight = avail + 'px'; t.style.minHeight = (st.layout == 'ledger') ? Math.min(160, avail) + 'px' : ''; }
     };
     obj.elGripReset = function() {
         var ph = pluginHandler.eventlog, st = ph.elState();
