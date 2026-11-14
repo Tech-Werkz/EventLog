@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Known Issues]
 - None. Please feel free to submit an issue via [GitHub](https://github.com/ryanblenis/MeshCentral-EventLog) if you find anything.
 
-## [1.0.0] - 2026-11-14
+## [0.1.14] - 2026-11-14
 ### Added
 - **Alerts.** A config set can now hold alert rules. When incoming events match a rule, the plugin raises a MeshCentral device event (action `eventlogalert`), which is stored in the device's Events list
   - A rule can filter by Entry Type, Log, Source (`*` wildcards), Event IDs (`1112, 100-199`) and message text, and can require *N matching events within M minutes*. A per-device cooldown stops one noisy event from alerting repeatedly
@@ -14,6 +14,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - Rules are evaluated on the server as batches arrive, before the History include/exclude rules, so an event you choose not to store can still alert. No agent core update is needed
   - Events older than one hour are ignored, so a newly installed agent's 24 h backlog does not fire a burst of alerts
 ### Changed
+- **Permissions.** The plugin now registers two permissions with MeshCentral's plugin permission system, *Event Log: Live Tab* and *Event Log: History Tab*, which administrators grant per user in MeshCentral's permissions dialog (global, device group or device level). Both default to **denied**: only users who have been granted them can use the plugin, and they still need MeshCentral rights on the device
+  - History and Collect now are checked on the server. Without the permission the server sends nothing
+  - Without Live permission the tab never opens the live tunnel and hides the Live view; without History permission it hides History. A user with neither sees a short notice instead of the tab
+  - If this MeshCentral has no plugin permission API, the plugin falls back to full administrators only, and logs a line at startup saying so
+  - Anyone who could use the plugin before must now be granted the permissions
+  - The permission check detects how MeshCentral's `getAccessPermissions` has to be called, and every refusal is written to the server log with the reason (`EVENTLOG: permission "deviceLiveTab" refused for <user> ...`), once per user and permission per minute. The startup log states where the API was found
+  - The tab re-checks its permission on every device page refresh and every 30 s (at most once per 5 s per device), so a permission that is granted *or revoked* takes effect without reloading the page; a revoked Live tab stops its tunnel. A refused tab's notice has a "Check again" link
+  - The server log also records grants (`permission "deviceLiveTab" granted to <user> (siteadmin=...)`), once per user, permission and device per 5 minutes, so you can see what MeshCentral answered
 - **Saving a config set now tells you what happened.** A status line next to Save shows "Saving...", then a confirmation with the time, or the reason it failed (or a warning if the server does not answer within 10 seconds). Saving the Default set used to get no answer at all
 - Saving a *new* config set no longer leaves the form on "new": pressing Save a second time used to create a duplicate set
 - The admin actions (save, delete, assign) now check on the server that the caller is a MeshCentral administrator; before, only the admin page itself did

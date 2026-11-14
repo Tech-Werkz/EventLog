@@ -23,6 +23,11 @@ Once installed, you'll need to update your agent cores in order to use the live 
 
 As a proof of concept, several methods were employed to become familiar with the [MeshCentral2](https://github.com/Ylianst/MeshCentral) project. 
 
+#### Permissions
+Access to the Event Log tab is controlled with MeshCentral's plugin permissions. In MeshCentral's permissions dialog (global, device group or device level) grant **Event Log: Live Tab** and/or **Event Log: History Tab**. Both are denied by default, so only the users you allow can use the plugin, and they also need MeshCentral rights on the device. Without a permission the matching view is hidden, History data and *Collect now* are refused by the server, and the live tunnel is not opened. The plugin admin page is limited to MeshCentral administrators.
+
+Live is opened by the browser through MeshCentral's own relay tunnel, so its permission is enforced by the tab; a user who also has MeshCentral's console rights on a device can still run `plugin eventlog getlog` there.
+
 #### Plugin Admin
 You can now create configuration sets and assign them to nodes or meshes. Need to collect events from a new log file other than Application/System? Just add it and assign!
 
