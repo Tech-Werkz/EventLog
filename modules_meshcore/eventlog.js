@@ -7,8 +7,6 @@
 
 "use strict";
 var mesh;
-var periodicEventLogTimer = null;
-var obj = this;
 var _sessionid;
 var isWsconnection = false;
 var wscon = null;
@@ -51,6 +49,7 @@ var getlogCallback = function (output) {
         var db = require('SimpleDataStore').Shared();
         var cfg = getEventLogConfig();
         response.uid = cfg.uid;
+        response.cfg = cfg;
         response.data = JSON.parse(output.stdout);
         wscon.write(new Buffer(JSON.stringify(response)));
     }
@@ -140,36 +139,6 @@ var runPwshCollector = function(func, passedParams) {
             }
             popTmpFile(fileName);
             dbg('Running powershell: '+sinceTimePre+"Get-WinEvent -FilterHashTable @{"+sinceTimeStr+"LogName='"+params.fromLog.split(',').join("','")+"'; Level="+entryTypeCodes.join(',')+"} -MaxEvents "+params.num+" | Select-Object LogName, Level, TimeCreated, ProviderName, Message, Id "+convertToJsonText+" | Out-File "+fileName);
-        } catch (e) {
-            dbg('Powershell run error: '+e.stack);
-        }
-        
-    });
-};
-
-var runPwshTest = function(func) {
-    dbg('pwsh test function');
-    var fileRand = Math.random().toString(32).replace('0.', '');
-    var fileName = 'psout'+fileRand+'.txt';
-    pushTmpFile(fileName);
-    var ret = {};
-    ret.child = require('child_process').execFile("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",["-command \"$PSVersionTable.PSVersion.Major | Out-File "+fileName+" -Encoding UTF8\""]);
-    ret.child.stdout.str = ''; ret.child.stdout.on('data', function (c) { this.str += c.toString(); });
-    ret.child.stderr.str = ''; ret.child.stderr.on('data', function (c) { this.str += c.toString(); });
-    //ret.child.on('exit', func(ret));
-    ret.child.on('exit', function (code) {
-        var o = {};
-        o.stdout = this.stdout.str;
-        o.stderr = this.stderr.str;
-        try {
-            // buffer the output to text and strip nasty characters
-            o.stdout = require('fs').readFileSync(fileName, 'utf8').toString();
-            if (o.stdout) {
-                o.stdout = o.stdout.trim();
-                o.stdout = o.stdout.replace(/^\uFEFF/, '').replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, ''); 
-                func(o);
-            }
-            popTmpFile(fileName);
         } catch (e) {
             dbg('Powershell run error: '+e.stack);
         }
@@ -308,20 +277,19 @@ var journalMsgText = function(m) {
     return String(m);
 };
 
-// journalctl -o json is NDJSON: one object per line. Returns {events, cursor, truncated}.
+// journalctl -o json is NDJSON: one object per line. Returns {events}.
 var parseJournalNdjson = function(txt, params) {
-    var out = { events: [], cursor: null, truncated: false };
+    var out = { events: [] };
     var priSet = null;
     if (params.priorities != null) { priSet = {}; for (var i = 0; i < params.priorities.length; i++) { priSet[params.priorities[i]] = true; } }
     var lines = String(txt).split('\n');
-    var max = 2000; // batch cap; the cursor of the last examined line lets the next run drain the rest
+    var max = 2000; // batch cap
     for (var li = 0; li < lines.length; li++) {
         var ln = lines[li];
         if (ln.length < 2) continue;
         var j = null;
         try { j = JSON.parse(ln); } catch (e) { continue; } // tolerate the truncated trailing line of a byte-capped read
-        if (out.events.length >= max) { out.truncated = true; break; }
-        if (j.__CURSOR) out.cursor = j.__CURSOR;
+        if (out.events.length >= max) break;
         var pri = Number(j.PRIORITY); if (isNaN(pri)) pri = 6;
         if (priSet != null && !priSet[pri]) continue;
         var cat = journalCategory(j);
@@ -346,24 +314,17 @@ var parseJournalNdjson = function(txt, params) {
     return out;
 };
 
-// build and run one journalctl query. func({events, cursor, truncated, error?})
+// build and run one journalctl query. func({events})
 var runJournalCollector = function(func, passedParams) {
-    var params = { num: 200, priorities: null, cursor: null, sinceSec: null, unit: null, kernelOnly: false, boot: false, facility: null, transport: null, catFilter: null, catRules: null, srcRules: null, maxAgeHours: 24, live: false };
+    var params = { num: 200, priorities: null, sinceSec: null, unit: null, kernelOnly: false, boot: false, facility: null, transport: null, catFilter: null, catRules: null, srcRules: null };
     for (var pk in passedParams) { if (passedParams[pk] !== undefined && passedParams[pk] !== null) params[pk] = passedParams[pk]; }
     var fileName = pickTmpDir() + '/evljout' + Math.random().toString(32).replace('0.', '') + '.txt';
     pushTmpFile(fileName);
     var cmd = 'journalctl --no-pager -o json';
     if (linuxCaps != null && linuxCaps.jver >= 236) cmd += ' --output-fields=MESSAGE,PRIORITY,SYSLOG_IDENTIFIER,SYSLOG_FACILITY,_PID,_COMM,_SYSTEMD_UNIT,_TRANSPORT,_BOOT_ID';
-    if (params.live) {
-        cmd += ' -r -n ' + (Number(params.num) || 200);
-        if (params.sinceSec != null) cmd += ' --since "@' + Math.floor(Number(params.sinceSec)) + '"';
-        if (params.boot) cmd += ' -b';
-    } else {
-        // incremental history collection: chronological order so the last line's cursor is the resume point
-        if (params.cursor != null && params.cursor != '') cmd += ' --after-cursor="' + shSanitize(params.cursor) + '"';
-        else if (params.sinceSec != null) cmd += ' --since "@' + Math.floor(Number(params.sinceSec)) + '"';
-        else cmd += ' --since "-' + (Number(params.maxAgeHours) || 24) + 'h"'; // bound the first-run backfill
-    }
+    cmd += ' -r -n ' + (Number(params.num) || 200);
+    if (params.sinceSec != null) cmd += ' --since "@' + Math.floor(Number(params.sinceSec)) + '"';
+    if (params.boot) cmd += ' -b';
     if (params.priorities != null) { var mx = 0; for (var i = 0; i < params.priorities.length; i++) { if (params.priorities[i] > mx) mx = params.priorities[i]; } cmd += ' -p ' + mx; } // -p N = 0..N prefilter; exact set applied in the parser
     if (params.kernelOnly) cmd += ' -k';
     if (params.unit != null) cmd += ' -u "' + shSanitize(params.unit) + '"';
@@ -379,81 +340,11 @@ var runJournalCollector = function(func, passedParams) {
             var res = parseJournalNdjson(txt, params);
             if (o.stderr != null && o.stderr.length > 0 && res.events.length == 0) {
                 dbg('journalctl stderr: ' + o.stderr.substring(0, 300));
-                if (params.cursor != null && o.stderr.toLowerCase().indexOf('cursor') !== -1) res.error = 'cursor';
             }
             func(res);
         } catch (e) { dbg('journal run error: ' + e); try { popTmpFile(fileName); } catch (e2) { } }
     });
 };
-
-// periodic history batch finished: push to the server; the cursor is committed when the server acks (setLVDOC)
-var linuxGatherCallback = function(res) {
-    try {
-        if (res.error == 'cursor') { db.Put('pluginEventLog_jcursor', ''); dbg('journal cursor invalid, cleared (journal rotated?)'); return; }
-        if (res.events.length == 0) {
-            if (res.cursor != null) db.Put('pluginEventLog_jcursor', res.cursor); // nothing to send: advance locally
-            return;
-        }
-        mesh = require('MeshAgent');
-        var cfg = getEventLogConfig();
-        mesh.SendCommand({
-            "action": "plugin", "plugin": "eventlog", "pluginaction": "gatherlogs",
-            "uid": (cfg.uid != null) ? cfg.uid : null,
-            "os": "linux", "cursor": res.cursor, "caps": linuxCaps,
-            "data": JSON.stringify(res.events)
-        });
-    } catch (e) { dbg('linuxGatherCallback error: ' + e); }
-};
-
-var capturePeriodicLinux = function() {
-    try {
-        dbg('Periodic linux runner starting');
-        var cfg = getEventLogConfig();
-        if (cfg.historyEnabled !== true) return;
-        probeLinuxCaps(function (caps) {
-            if (!caps.journalctl) { dbg('journalctl not available; periodic collection disabled'); return; }
-            var cur = db.Get('pluginEventLog_jcursor');
-            if (cur == '' || cur == null) cur = null;
-            var lv = db.Get('pluginEventLog_lvdoc_lx');
-            if (lv == '' || lv == null || isNaN(Number(lv))) lv = null; else lv = Number(lv);
-            runJournalCollector(linuxGatherCallback, { cursor: cur, sinceSec: lv, priorities: levelsToPriorities(cfg.historyEntryTypes),
-                catRules: evlRules(cfg.historyCategories, cfg.historyCategoriesMode), srcRules: evlRules(cfg.historySources, cfg.historySourcesMode) });
-        });
-    } catch (e) { dbg('Periodic linux runner error: ' + e); }
-};
-
-var gatherlogsCallback = function(output) {
-    mesh = require('MeshAgent');
-    var db = require('SimpleDataStore').Shared();
-    var cfg = getEventLogConfig();
-    var cuid = null;
-    if (cfg.uid != null) {
-      cuid = cfg.uid;
-    }
-    mesh.SendCommand({ "action": "plugin", "plugin": "eventlog", "pluginaction": "gatherlogs", "uid": cuid, "data": output.stdout});
-};
-
-var capturePeriodicEventLog = function() {
-    if (PLAT == 'linux') { capturePeriodicLinux(); return; }
-    if (process.platform != 'win32') {
-      dbg('Periodic runner not running (unsupported platform)');
-      return false;
-    }
-    try {
-        dbg('Periodic runner starting');
-        var db = require('SimpleDataStore').Shared();
-        // this is where we collect logs, either to a file to be Xferred later, or now, whichev.
-        var lvdoc = db.Get('pluginEventLog_lvdoc');
-        if (lvdoc == '' || lvdoc == null || isNaN(Number(lvdoc))) lvdoc = null;
-        var cfg = getEventLogConfig();
-        var fromLogs = cfg.historyLogs;
-        var entryTypes = cfg.historyEntryTypes;
-        if (cfg.historyEnabled !== true) return;
-        runPwshCollector(gatherlogsCallback, {fromLog: fromLogs, num: 200, sinceTime: lvdoc, entryTypeNum: entryTypes });
-    } catch (e) { dbg('Periodic runner error: ' + e); }
-};
-
-if (periodicEventLogTimer == null) { periodicEventLogTimer = setInterval(capturePeriodicEventLog, 1*60*1000); } // 1 minute(s)
 
 function consoleaction(args, rights, sessionid, parent) {
         isWsconnection = false;
@@ -542,7 +433,7 @@ function consoleaction(args, rights, sessionid, parent) {
             var num = Number(args.num);
             if (isNaN(num) || num <= 0) num = Number(cfg.liveNum) || 100;
             if (num > 1000) num = 1000;
-            var entryTypes = cfg.liveEntryTypes || cfg.historyEntryTypes;
+            var entryTypes = cfg.liveEntryTypes || [2,3];
             if (PLAT == 'linux') {
                 var lxWs = isWsconnection, lxCon = wscon; // capture: the callback runs after consoleaction returned
                 var lxSince = (args.since != null && !isNaN(Number(args.since))) ? (Number(args.since) + 1) : null;
@@ -550,14 +441,14 @@ function consoleaction(args, rights, sessionid, parent) {
                 probeLinuxCaps(function (caps) {
                     var reply = function (events) {
                         if (!lxWs || lxCon == null) return;
-                        try { lxCon.write(new Buffer(JSON.stringify({ uid: cfg.uid, os: 'linux', caps: caps, data: events }))); } catch (e) { dbg('live reply error ' + e); }
+                        try { lxCon.write(new Buffer(JSON.stringify({ uid: cfg.uid, cfg: cfg, os: 'linux', caps: caps, data: events }))); } catch (e) { dbg('live reply error ' + e); }
                     };
                     if (!caps.journalctl) {
                         reply([{ LogName: 'System', Level: 3, Priority: 4, TimeCreated: '/Date(' + new Date().getTime() + ')/', ProviderName: 'eventlog-plugin', Unit: '', Transport: '', BootId: '', Id: '',
                                  Message: 'systemd-journald was not found on this endpoint. Flat-file /var/log support is planned for a later plugin version.' }]);
                         return;
                     }
-                    var p = { live: true, num: num, priorities: levelsToPriorities(entryTypes), sinceSec: lxSince,
+                    var p = { num: num, priorities: levelsToPriorities(entryTypes), sinceSec: lxSince,
                               catRules: evlRules(cfg.liveCategories, cfg.liveCategoriesMode), srcRules: evlRules(cfg.liveSources, cfg.liveSourcesMode) };
                     if (lxSel == 'kernel') p.kernelOnly = true;
                     else if (lxSel == 'auth') { p.facility = 'auth,authpriv'; p.catFilter = 'Auth'; }
@@ -587,47 +478,6 @@ function consoleaction(args, rights, sessionid, parent) {
             } catch(e) { dbg('getlivelogs error '+e); }
             break;
         }
-        case 'collectnow': { // run the periodic history collection right away (requested from the device page)
-            try { capturePeriodicEventLog(); } catch (e) { dbg('collectnow error ' + e); }
-            break;
-        }
-        case 'setLVDOC': { // set last verified date of collection (e.g. last successful log collection) from the server
-            try {
-                var db = require('SimpleDataStore').Shared();
-                if (args.cursor != null && args.cursor != '') {
-                    // linux: the server acknowledged this batch - commit the journal cursor (at-least-once delivery)
-                    db.Put('pluginEventLog_jcursor', String(args.cursor));
-                    var lxsv = Math.floor(Number(args.value) / 1000) + 1; // journald times are UTC epoch ms: no local-offset math
-                    if (!isNaN(lxsv)) db.Put('pluginEventLog_lvdoc_lx', String(lxsv));
-                    dbg('linux cursor committed');
-                    break;
-                }
-                var dt = new Date();
-                var offsetMin = dt.getTimezoneOffset();
-                //dbg('offset min: '+offsetMin);
-                var offsetSec = offsetMin * 60;
-                //dbg('offset sec: '+offsetSec);
-                //dbg('offset '+offsetSec);
-                var savetime = Number(args.value).toString();
-                savetime = Number(savetime.slice(0, -3));     // strip milliseconds
-                //dbg('savetime2 '+savetime);
-                savetime = savetime - offsetSec;              // offset seconds
-                savetime += 2; // timers are fuzzy. two second delay so we don't reXmit the last message
-                savetime = savetime.toString();
-                dbg('setting lvdoc to '+savetime);
-                db.Put('pluginEventLog_lvdoc', savetime);          // to minimize Xferred event logs
-            } catch (e) { dbg('setLVDOC error: '+e) }
-            break;
-        }
-        case 'sendlogs': {
-          mesh.SendCommand({ 
-                  "action": "plugin", 
-                  "plugin": "eventlog",
-                  "pluginaction": "sendlogs",
-                  "data": JSON.stringify({test: "testing"})
-          });
-          break;
-        }
         case 'setConfigBlob': {
             if (PLAT == 'linux') {
                 linuxCaps = null; // config changed: re-probe capabilities
@@ -639,16 +489,6 @@ function consoleaction(args, rights, sessionid, parent) {
                 } catch (e) { dbg('setconfigBlob (linux) ' + e); }
                 break;
             }
-            runPwshTest(function (output) {
-                var version = parseInt(output.stdout);
-                if (version <= 2) {
-                    dbg('Plugin EventLog disabled on endpoint. Powershell version not capable');
-                    if (periodicEventLogTimer != null) { try { clearInterval(periodicEventLogTimer); } catch (e) { } }
-                    periodicEventLogTimer = null;
-                } else {
-                    dbg('Powershell version is >= 3. Continuing as planned.');
-                }
-            });
             try {
                 var db = require('SimpleDataStore').Shared();
                 var cfg = args.cfg;
@@ -684,10 +524,7 @@ function getDefaultConfig() {
      name: 'Default',
      liveLogs: 'Application,System',
      liveNum: 100,
-     liveEntryTypes: [2,3],
-     historyEnabled: true,
-     historyLogs: 'Application,System',
-     historyEntryTypes: [2,3]
+     liveEntryTypes: [2,3]
    };
 }
 

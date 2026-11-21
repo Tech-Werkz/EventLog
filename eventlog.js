@@ -13,9 +13,6 @@ module.exports.eventlog = function (parent) {
     obj.parent = parent;
     obj.meshServer = parent.parent;
     obj.db = null;
-    obj._lastMeta = {};   // nodeid -> last node metadata written, so repeat reports are not re-stored
-    obj._lastAck = {};    // nodeid -> newest collection position acknowledged, so it never goes backwards
-    obj._cfgCache = {};   // nodeid -> { uid, cfg, t }: the node's resolved config set, for ingest filtering
 
     // Functions that need to be brought to the front end for processing.
     // (If they need to be accessed in the GUI, they should be here.)
@@ -29,8 +26,6 @@ module.exports.eventlog = function (parent) {
       'onRemoteEventLogStateChange',
       'createRemoteEventLog',
       'onDeviceRefreshEnd',
-      'onLoadHistory',
-      'onCollectNow',
       'onAccess',
       'elCan',
       'elAccessGate',
@@ -58,7 +53,6 @@ module.exports.eventlog = function (parent) {
       'elEmptyText',
       'elRenderDetailHtml',
       'elRenderStatus',
-      'elSetView',
       'elSetLayout',
       'elToggleFold',
       'elSetShow',
@@ -83,9 +77,6 @@ module.exports.eventlog = function (parent) {
       'elAutoTick',
       'elRefresh',
       'elTogglePause',
-      'elLoadHistory',
-      'elLoadMore',
-      'elCollectNow',
       'elExportCsv',
       // sizing / density (v0.1.2)
       'elLoadJson',
@@ -112,9 +103,6 @@ module.exports.eventlog = function (parent) {
       'elLbl',
       'elRawOf',
       'elSelCat',
-      'elHistAutoFill',
-      'elHistRefilter',
-      'elCounts',
       // live tunnel gating (v0.1.11)
       'elTabVisible',
       'elStopLive',
@@ -129,8 +117,7 @@ module.exports.eventlog = function (parent) {
 
     obj._pluginPermissions = function() {
         return {
-            "deviceLiveTab": "Event Log: Live Tab",
-            "deviceHistoryTab": "Event Log: History Tab"
+            "deviceLiveTab": "Event Log: Live Tab"
         };
     };
 
@@ -138,10 +125,9 @@ module.exports.eventlog = function (parent) {
     // Registered with MeshCentral's plugin permission system, so they appear in MeshCentral's permissions dialog
     // (global / device group / device). Default is "denied": only users on the allowed list may use the plugin.
     obj.PERMISSIONS = {
-        deviceLiveTab:    { title: 'Event Log: Live Tab',    desc: 'Can open the live event view of a device',            default: 'denied' },
-        deviceHistoryTab: { title: 'Event Log: History Tab', desc: 'Can view collected event history and collect now',    default: 'denied' }
+        deviceLiveTab:    { title: 'Event Log: Live Tab',    desc: 'Can open the live event view of a device',            default: 'denied' }
     };
-    obj.ACTION_PERMISSION = { getNodeHistory: 'deviceHistoryTab', collectNow: 'deviceHistoryTab' };   // user-initiated server actions that need one
+    obj.ACTION_PERMISSION = {};   // no user-initiated server action needs a permission: Live runs through the browser's own relay tunnel
     obj.registerPermissions = function() {
         if (obj._permsRegistered) return true;
         var cands = [obj.parent, obj.meshServer && obj.meshServer.pluginHandler, obj];
@@ -220,9 +206,9 @@ module.exports.eventlog = function (parent) {
         var ctx = { nodeid: command.nodeid, meshid: command.meshid };
         var rights = true;
         try { if (grandparent != null && typeof grandparent.GetNodeRights == 'function') rights = (grandparent.GetNodeRights(myparent.user, command.meshid, command.nodeid) != 0); } catch (e) { }
-        var pair = rights ? [obj.canUse(myparent.user, 'deviceLiveTab', ctx), obj.canUse(myparent.user, 'deviceHistoryTab', ctx)] : [Promise.resolve(false), Promise.resolve(false)];
-        return Promise.all(pair).then(function (r) {
-            try { myparent.ws.send(JSON.stringify({ action: 'plugin', plugin: 'eventlog', method: 'onAccess', nodeid: command.nodeid, live: r[0], history: r[1] })); } catch (e) { }
+        var check = rights ? obj.canUse(myparent.user, 'deviceLiveTab', ctx) : Promise.resolve(false);
+        return check.then(function (live) {
+            try { myparent.ws.send(JSON.stringify({ action: 'plugin', plugin: 'eventlog', method: 'onAccess', nodeid: command.nodeid, live: live })); } catch (e) { }
         });
     };
 
@@ -334,7 +320,6 @@ module.exports.eventlog = function (parent) {
         if (ph.st == null) {
             ph.byKey = {};
             ph.st = {
-                view: 'live',
                 os: ph.elPlatform(),                                 // 'windows' | 'linux' | null (state resets on node change)
                 lsel: '',                                            // Linux view selector ('', kernel, auth, audit, boot)
                 meta: null,                                          // {os, caps} reported by the agent / server
@@ -348,12 +333,11 @@ module.exports.eventlog = function (parent) {
                 heights: { ledger: Number(getstore('evl_h_ledger', '0')) || 0, viewer: Number(getstore('evl_h_viewer', '0')) || 0 }, // user table height (px) per layout, 0 = automatic
                 filters: { levels: null, logs: null, sources: null, ids: '', text: '' },
                 sort: { key: 'time', dir: -1 },
-                cfg: null,                                           // resolved config set for this node (from onLoadHistory)
+                cfg: null,                                           // resolved config set for this node (sent by the agent with every live reply)
                 selected: null, expanded: {}, dtab: 'general', raw: {},
                 srcMore: false,
                 paused: false, pending: [],
-                live: { events: [], last: null },
-                hist: { events: [], total: 0, stored: 0, lastCollected: null, skip: 0, loaded: false, loading: false, enabled: true, retentionDays: null, facets: null }
+                live: { events: [], last: null }
             };
         }
         return ph.st;
@@ -461,7 +445,7 @@ module.exports.eventlog = function (parent) {
         st._text = String(st.filters.text || '').trim().toLowerCase();
         var ranges = { '1h': 3600e3, '24h': 86400e3, '7d': 7 * 86400e3, '30d': 30 * 86400e3 };
         st._cutoff = ranges[st.range] ? (Date.now() - ranges[st.range]) : 0;
-        var evs = (st.view == 'live') ? st.live.events : st.hist.events;
+        var evs = st.live.events;
         var rows = [], counts = { level: {}, log: {}, source: {} };
         for (var i in evs) {
             var ev = evs[i];
@@ -630,7 +614,7 @@ body.night #pluginEventLog {
     };
 
     // ---- Plugin permissions (browser side) ----------------------------------------------------
-    // The server decides (MeshCentral's plugin permissions: deviceLiveTab / deviceHistoryTab). The tab only asks
+    // The server decides (MeshCentral's plugin permissions: deviceLiveTab). The tab only asks
     // once per device and shows or hides its views accordingly. Until the answer arrives nothing is shown or started.
     obj.elCan = function(what) {
         var a = pluginHandler.eventlog.elAccess;
@@ -655,7 +639,7 @@ body.night #pluginEventLog {
         var ph = pluginHandler.eventlog;
         if (!Q('pluginEventLog')) return false;
         var a = ph.elAccess, known = (a != null && typeof currentNode != 'undefined' && currentNode != null && a.nodeid == currentNode._id);
-        if (known && (a.live || a.history)) {
+        if (known && a.live) {
             if (Q('evlNotice')) QH('pluginEventLog', '');   // permission was granted since the notice was drawn
             return true;
         }
@@ -670,15 +654,12 @@ body.night #pluginEventLog {
     };
     obj.onAccess = function(server, message) {
         var ph = pluginHandler.eventlog, prev = ph.elAccess;
-        ph.elAccess = { nodeid: message.nodeid, live: (message.live === true), history: (message.history === true) };
+        ph.elAccess = { nodeid: message.nodeid, live: (message.live === true) };
         if (typeof currentNode == 'undefined' || currentNode == null || currentNode._id != message.nodeid) return;
-        if (prev != null && prev.nodeid == ph.elAccess.nodeid && prev.live == ph.elAccess.live && prev.history == ph.elAccess.history && (Q('evlWrap') || Q('evlNotice'))) return;   // nothing changed: keep the tab as it is
+        if (prev != null && prev.nodeid == ph.elAccess.nodeid && prev.live == ph.elAccess.live && (Q('evlWrap') || Q('evlNotice'))) return;   // nothing changed: keep the tab as it is
         if (!ph.elAccess.live) ph.elStopLive();
         if (Q('evlWrap')) QH('pluginEventLog', '');   // rebuild the shell with the views this user may use
-        if (ph.elEnsureShell()) {
-            var st = ph.elState();
-            if (st.view == 'history' && ph.elAccess.history && !st.hist.loaded && !st.hist.loading) ph.elLoadHistory(true);
-        }
+        ph.elEnsureShell();
         setTimeout(function() { try { pluginHandler.eventlog.elEnsureLive(); } catch (e) { } }, 0);
     };
 
@@ -688,9 +669,6 @@ body.night #pluginEventLog {
         if (!Q('pluginEventLog')) return false;
         if (!ph.elAccessGate()) return false;
         if (!Q('evlWrap')) {
-            var st0 = ph.elState();   // open on a view this user is allowed to see
-            if (st0.view == 'live' && !ph.elCan('live')) st0.view = 'history';
-            else if (st0.view == 'history' && !ph.elCan('history')) st0.view = 'live';
             QH('pluginEventLog', '<div id=evlWrap><div id=evlToolbar></div><div id=evlChips class=evlChips></div><div id=evlBody></div><div id=evlStatus class=evlStatus></div></div>');
             ph.elRenderShell();
         }
@@ -703,11 +681,8 @@ body.night #pluginEventLog {
         var ph = pluginHandler.eventlog, st = ph.elState();
         var esc = EscapeHtml;
         var h = '<div class=evlBar>';
-        h += '<div class=evlSeg>' +
-             '<button id=evlVLive' + (ph.elCan('live') ? '' : ' style=display:none') + ' class="' + (st.view == 'live' ? 'on' : '') + '" onclick="return pluginHandler.eventlog.elSetView(\'live\')">&#9679; Live</button>' +
-             '<button id=evlVHist' + (ph.elCan('history') ? '' : ' style=display:none') + ' class="' + (st.view == 'history' ? 'on' : '') + '" onclick="return pluginHandler.eventlog.elSetView(\'history\')">History</button></div>';
         if (st.os == 'linux') {
-            h += '<span class=evlLbl>View</span> <select id=evlLxSel class=evlSel title="Log view - in Live view this is queried from journalctl directly (Kernel = -k, Security = auth facilities, This boot = -b)" onchange="return pluginHandler.eventlog.elSelCat(this.value)">';
+            h += '<span class=evlLbl>View</span> <select id=evlLxSel class=evlSel title="Log view - queried from journalctl directly (Kernel = -k, Security = auth facilities, This boot = -b)" onchange="return pluginHandler.eventlog.elSelCat(this.value)">';
             [['','All'],['kernel','Kernel'],['auth','Security (auth)'],['audit','Audit'],['boot','This boot']].forEach(function(o){ h += '<option value="' + o[0] + '"' + (st.lsel == o[0] ? ' selected' : '') + '>' + o[1] + '</option>'; });
             h += '</select>';
         }
@@ -720,14 +695,14 @@ body.night #pluginEventLog {
         h += '<select id=evlRangeSel class=evlSel title="Time range" onchange="return pluginHandler.eventlog.elSetRange(this.value)">';
         [['all','Any time'],['1h','Last hour'],['24h','Last 24 h'],['7d','Last 7 days'],['30d','Last 30 days']].forEach(function(o){ h += '<option value=' + o[0] + (st.range == o[0] ? ' selected' : '') + '>' + o[1] + '</option>'; });
         h += '</select>';
-        h += '<span class=evlLbl>Show</span> <select id=evlShowSel class=evlSel title="Entries per log (Live) / per page (History)" onchange="return pluginHandler.eventlog.elSetShow(this.value)">';
+        h += '<span class=evlLbl>Show</span> <select id=evlShowSel class=evlSel title="Entries per log" onchange="return pluginHandler.eventlog.elSetShow(this.value)">';
         [10,15,25,50,100,250,500].forEach(function(n){ h += '<option value=' + n + (st.show == n ? ' selected' : '') + '>' + n + '</option>'; });
         h += '</select>';
         h += '<span class=evlLbl>Rows</span> <select id=evlRowsSel class=evlSel title="Row density: Compact (tight), Normal, Wrap (message text wraps onto several lines)" onchange="return pluginHandler.eventlog.elSetRows(this.value)">';
         [['dense','Compact'],['normal','Normal'],['wrap','Wrap']].forEach(function(o){ h += '<option value=' + o[0] + (st.rows == o[0] ? ' selected' : '') + '>' + o[1] + '</option>'; });
         h += '</select>';
         h += '<button id=evlFoldBtn class="evlBtn ' + (st.fold ? 'on' : '') + '" title="Fold repeated events into one line" onclick="return pluginHandler.eventlog.elToggleFold()">&#8659; Fold repeats</button>';
-        h += '<button id=evlPauseBtn class=evlBtn title="Pause live updates" onclick="return pluginHandler.eventlog.elTogglePause()" ' + (st.view == 'history' ? 'style=display:none' : '') + '>' + (st.paused ? '&#9654;' : '&#10074;&#10074;') + '</button>';
+        h += '<button id=evlPauseBtn class=evlBtn title="Pause live updates" onclick="return pluginHandler.eventlog.elTogglePause()">' + (st.paused ? '&#9654;' : '&#10074;&#10074;') + '</button>';
         h += '<button class=evlBtn title="Refresh" onclick="return pluginHandler.eventlog.elRefresh()">&#8635;</button>';
         h += '<button class=evlBtn title="Export the filtered rows as CSV" onclick="return pluginHandler.eventlog.elExportCsv()">&#10515; CSV</button>';
         h += '<div class=evlSeg title="Layout">' +
@@ -748,7 +723,7 @@ body.night #pluginEventLog {
         // refresh the Log/Source dropdown options (ledger layout)
         if (st.layout == 'ledger') {
             var esc = EscapeHtml;
-            var counts = ph.elCounts(fr);
+            var counts = fr.counts;
             [['evlLogSel', 'log', st.filters.logs], ['evlSrcSel', 'source', st.filters.sources]].forEach(function(cfg) {
                 var sel = Q(cfg[0]); if (!sel) return;
                 var names = Object.keys(counts[cfg[1]]).sort();
@@ -765,7 +740,7 @@ body.night #pluginEventLog {
     obj.elRenderChips = function(fr) {
         var ph = pluginHandler.eventlog, st = ph.elState();
         var esc = EscapeHtml, h = '';
-        var counts = ph.elCounts(fr);
+        var counts = fr.counts;
         h += '<span class=evlLbl>Level</span>';
         ph.elLevelInfo().forEach(function(li) {
             if (li.n == 0 && !counts.level[0]) return; // hide LogAlways unless present
@@ -795,7 +770,7 @@ body.night #pluginEventLog {
             return '<div class=evlFacet role=button tabindex=0 onclick="return pluginHandler.eventlog.elToggleFacet(\'' + kind + '\',\'' + esc(name).replace(/'/g, '&apos;') + '\')">' +
                    '<span class="cb' + (on ? ' on' : '') + '">' + (on ? '&#10003;' : '') + '</span><span class=t title="' + esc(name) + '">' + esc(name) + '</span><span class=n>' + count + '</span></div>';
         };
-        var counts = ph.elCounts(fr);
+        var counts = fr.counts;
         h += '<h4>' + ph.elLbl('log') + '</h4>';
         Object.keys(counts.log).sort().forEach(function(n) {
             h += facet('logs', n, counts.log[n], (st.filters.logs == null || st.filters.logs[n]));
@@ -815,7 +790,7 @@ body.night #pluginEventLog {
         var esc = EscapeHtml;
         var frows = st.fold ? ph.elFold(fr.rows) : fr.rows.map(function(ev) { return { ev: ev, count: 1, times: [ev.time] }; });
         st._matching = frows.length;
-        if (st.view == 'live' && frows.length > st.show) frows = frows.slice(0, st.show); // "Show N" = N displayed rows
+        if (frows.length > st.show) frows = frows.slice(0, st.show); // "Show N" = N displayed rows
         st._visible = frows.length;
         var sortTh = function(key, label) {
             var s = (st.sort.key == key) ? (' class=sorted') : '';
@@ -892,12 +867,6 @@ body.night #pluginEventLog {
 
     obj.elEmptyText = function() {
         var st = pluginHandler.eventlog.elState();
-        if (st.view == 'history') {
-            if (st.hist.loading) return 'Loading history&hellip;';
-            if (st.hist.enabled === false) return 'History collection is disabled for this device. Enable it in the plugin administration (Config Sets).';
-            if (st.hist.stored == 0) return 'No events stored yet. The agent sends collected events about once a minute once its core is loaded &mdash; use &quot;Collect now&quot; below, or check back shortly.';
-            return 'No events match the current filters. Adjust the filters above or reset them.';
-        }
         if (st._total == 0) return 'Waiting for events from the device&hellip;';
         return 'No events match the current filters. Adjust the filters above or reset them.';
     };
@@ -930,24 +899,14 @@ body.night #pluginEventLog {
         var ph = pluginHandler.eventlog, st = ph.elState();
         if (!Q('evlStatus')) return;
         var h = '';
-        if (st.view == 'live') {
-            if (ph.livelog == null) h += '<span class=warn>&#9679; Agent not connected &mdash; live view resumes when it reconnects</span>';
-            else if (st.paused) h += '<span class=warn>&#10074;&#10074; Paused' + (st.pending.length ? ' &middot; ' + st.pending.length + ' new buffered' : '') + '</span>';
-            else h += '<span class=live>&#9679; Live &middot; auto-refresh every 30 s</span>';
-            h += '<span>Showing ' + (st._visible || 0) + ' of ' + (st._matching || 0) + (st.fold ? ' folded rows' : ' rows') + ' &middot; ' + st._total + ' events loaded' + (st._total - st._shown > 0 ? ' &middot; ' + (st._total - st._shown) + ' hidden by filters' : '') + '</span>';
-            if (st.live.last) h += '<span>Last update <span class=evlMono>' + st.live.last.toLocaleTimeString() + '</span></span>';
-        } else {
-            h += '<span>History</span>';
-            if (st.hist.loading) h += '<span>Loading&hellip;</span>';
-            h += '<span>Showing ' + (st.fold ? ((st._visible || 0) + ' folded rows (' + st._shown + ' events)') : st._shown) + ' of ' + st.hist.total + ' in range &middot; ' + st.hist.stored + ' stored total' + (st.hist.retentionDays ? ' &middot; retention ' + st.hist.retentionDays + ' days' : '') + '</span>';
-            h += '<span>Last collected: <span class=evlMono>' + (st.hist.lastCollected ? ph.elFmtTime(st.hist.lastCollected) : 'never') + '</span></span>';
-            if (st.hist.events.length < st.hist.total) h += '<button class="evlBtn mini" onclick="return pluginHandler.eventlog.elLoadMore()">Load ' + Math.min(st.show, st.hist.total - st.hist.events.length) + ' more</button>';
-            h += '<button class="evlBtn mini" onclick="return pluginHandler.eventlog.elCollectNow()">Collect now</button>';
-            if (st.collectMsg) h += '<span>' + st.collectMsg + '</span>';
-        }
+        if (ph.livelog == null) h += '<span class=warn>&#9679; Agent not connected &mdash; live view resumes when it reconnects</span>';
+        else if (st.paused) h += '<span class=warn>&#10074;&#10074; Paused' + (st.pending.length ? ' &middot; ' + st.pending.length + ' new buffered' : '') + '</span>';
+        else h += '<span class=live>&#9679; Live &middot; auto-refresh every 30 s</span>';
+        h += '<span>Showing ' + (st._visible || 0) + ' of ' + (st._matching || 0) + (st.fold ? ' folded rows' : ' rows') + ' &middot; ' + st._total + ' events loaded' + (st._total - st._shown > 0 ? ' &middot; ' + (st._total - st._shown) + ' hidden by filters' : '') + '</span>';
+        if (st.live.last) h += '<span>Last update <span class=evlMono>' + st.live.last.toLocaleTimeString() + '</span></span>';
         if (st.os == 'linux' && st.meta && st.meta.caps) {
             if (st.meta.caps.journalctl === false) h += '<span class=warn>systemd-journald not found on this device &mdash; flat-file /var/log support arrives in a later plugin version</span>';
-            else if (st.meta.caps.persistent === false) h += '<span title="The journal is stored in memory only (/run/log/journal). Events collected into the server database are unaffected.">Volatile journal: the endpoint keeps logs since its last boot only</span>';
+            else if (st.meta.caps.persistent === false) h += '<span title="The journal is stored in memory only (/run/log/journal).">Volatile journal: the endpoint keeps logs since its last boot only</span>';
         }
         var parts = [];
         if (Object.keys(st.cols[st.layout] || {}).length > 0) parts.push('column widths');
@@ -959,14 +918,6 @@ body.night #pluginEventLog {
     };
 
     // ---- interactions ----
-    obj.elSetView = function(v) {
-        var ph = pluginHandler.eventlog, st = ph.elState();
-        if (!ph.elCan(v == 'live' ? 'live' : 'history')) return false;
-        st.view = v;
-        if (v == 'history' && !st.hist.loaded && !st.hist.loading) ph.elLoadHistory(true);
-        ph.elRenderShell();
-        return false;
-    };
     obj.elSetLayout = function(l) {
         var ph = pluginHandler.eventlog, st = ph.elState();
         st.layout = l; putstore('evl_layout', l);
@@ -977,23 +928,21 @@ body.night #pluginEventLog {
         var ph = pluginHandler.eventlog, st = ph.elState();
         st.fold = !st.fold; putstore('evl_fold', st.fold ? '1' : '0');
         var b = Q('evlFoldBtn'); if (b) b.classList.toggle('on', st.fold);
-        if (st.view == 'live' && st.fold) ph.elRequestLive(null);
+        if (st.fold) ph.elRequestLive(null);
         ph.elUpdate();
-        if (st.view == 'history' && st.fold) ph.elHistAutoFill();
         return false;
     };
     obj.elSetShow = function(n) {
         var ph = pluginHandler.eventlog, st = ph.elState();
         st.show = Number(n) || 100; putstore('evl_show', String(st.show));
-        if (st.view == 'live') ph.elRequestLive(null);
-        else ph.elLoadHistory(true);   // History: reload the first page with the new page size
+        ph.elRequestLive(null);
         ph.elUpdate();
         return false;
     };
     obj.elSetRange = function(r) {
         var ph = pluginHandler.eventlog, st = ph.elState();
         st.range = r; putstore('evl_range', r);
-        if (st.view == 'history') ph.elLoadHistory(true); else ph.elUpdate();
+        ph.elUpdate();
         return false;
     };
     // Linux view selector: in Live view the selection is pushed down to journalctl; in both views
@@ -1003,9 +952,8 @@ body.night #pluginEventLog {
         st.lsel = v;
         var catMap = { kernel: 'Kernel', auth: 'Auth', audit: 'Audit' };
         if (catMap[v]) { st.filters.logs = {}; st.filters.logs[catMap[v]] = 1; } else { st.filters.logs = null; }
-        if (st.view == 'live') ph.elRequestLive(null);
+        ph.elRequestLive(null);
         ph.elUpdate();
-        ph.elHistRefilter();
         return false;
     };
     obj.elSelLog = function(el) {
@@ -1013,7 +961,6 @@ body.night #pluginEventLog {
         if (el.value == '_multi') return false;
         if (el.value == '') st.filters.logs = null; else { st.filters.logs = {}; st.filters.logs[el.value] = 1; }
         ph.elUpdate();
-        ph.elHistRefilter();
         return false;
     };
     obj.elSelSource = function(el) {
@@ -1021,7 +968,6 @@ body.night #pluginEventLog {
         if (el.value == '_multi') return false;
         if (el.value == '') st.filters.sources = null; else { st.filters.sources = {}; st.filters.sources[el.value] = 1; }
         ph.elUpdate();
-        ph.elHistRefilter();
         return false;
     };
     obj.elToggleLevel = function(n) {
@@ -1031,19 +977,17 @@ body.night #pluginEventLog {
         var all = true; ph.elLevelInfo().forEach(function(li) { if (!st.filters.levels[li.n]) all = false; });
         if (all) st.filters.levels = null;
         ph.elUpdate();
-        ph.elHistRefilter();
         return false;
     };
     obj.elToggleFacet = function(kind, name) {
         var ph = pluginHandler.eventlog, st = ph.elState();
-        var counts = ph.elCounts(ph.elFiltered());
+        var counts = ph.elFiltered().counts;
         var universe = Object.keys(kind == 'logs' ? counts.log : counts.source);
         if (st.filters[kind] == null) { st.filters[kind] = {}; universe.forEach(function(n) { st.filters[kind][n] = 1; }); }
         if (st.filters[kind][name]) delete st.filters[kind][name]; else st.filters[kind][name] = 1;
         var all = true; universe.forEach(function(n) { if (!st.filters[kind][n]) all = false; });
         if (all) st.filters[kind] = null;
         ph.elUpdate();
-        ph.elHistRefilter();
         return false;
     };
     obj.elFacetsMore = function() {
@@ -1055,14 +999,14 @@ body.night #pluginEventLog {
         var ph = pluginHandler.eventlog, st = ph.elState();
         st.filters.ids = el.value;
         if (st._deb) clearTimeout(st._deb);
-        st._deb = setTimeout(function() { pluginHandler.eventlog.elUpdate(); pluginHandler.eventlog.elHistRefilter(); }, 200);
+        st._deb = setTimeout(function() { pluginHandler.eventlog.elUpdate(); }, 200);
         return false;
     };
     obj.elTextInput = function(el) {
         var ph = pluginHandler.eventlog, st = ph.elState();
         st.filters.text = el.value;
         if (st._deb) clearTimeout(st._deb);
-        st._deb = setTimeout(function() { pluginHandler.eventlog.elUpdate(); pluginHandler.eventlog.elHistRefilter(); }, 200);
+        st._deb = setTimeout(function() { pluginHandler.eventlog.elUpdate(); }, 200);
         return false;
     };
     obj.elClearFilter = function(kind) {
@@ -1070,7 +1014,6 @@ body.night #pluginEventLog {
         if (kind == 'ids' || kind == 'text') { st.filters[kind] = ''; var el = Q(kind == 'ids' ? 'evlIdIn' : 'evlTxtIn'); if (el) el.value = ''; }
         else st.filters[kind] = null;
         ph.elUpdate();
-        ph.elHistRefilter();
         return false;
     };
     obj.elResetFilters = function() {
@@ -1079,7 +1022,6 @@ body.night #pluginEventLog {
         var e1 = Q('evlIdIn'); if (e1) e1.value = '';
         var e2 = Q('evlTxtIn'); if (e2) e2.value = '';
         ph.elUpdate();
-        ph.elHistRefilter();
         return false;
     };
     obj.elSetRows = function(v) {
@@ -1317,7 +1259,6 @@ body.night #pluginEventLog {
         if (what == 'source') { st.filters.sources = {}; st.filters.sources[ev.source] = 1; }
         if (what == 'id') { st.filters.ids = String(ev.id); var el = Q('evlIdIn'); if (el) el.value = st.filters.ids; }
         ph.elUpdate();
-        ph.elHistRefilter();
         return false;
     };
     obj.elKeyNav = function(ev) {
@@ -1343,7 +1284,7 @@ body.night #pluginEventLog {
         fr.rows.forEach(function(ev) {
             lines.push([q(ev.levelName), q(new Date(ev.time).toISOString()), q(ev.log), q(ev.source), q(ev.id), q(ev.message)].join(','));
         });
-        var name = 'eventlog-' + ((typeof currentNode != 'undefined' && currentNode) ? String(currentNode.name).replace(/[^\w.-]+/g, '_') : 'device') + '-' + st.view + '.csv';
+        var name = 'eventlog-' + ((typeof currentNode != 'undefined' && currentNode) ? String(currentNode.name).replace(/[^\w.-]+/g, '_') : 'device') + '-live.csv';
         try {
             var blob = new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
             var a = document.createElement('a');
@@ -1383,8 +1324,7 @@ body.night #pluginEventLog {
     };
     obj.elRefresh = function() {
         var ph = pluginHandler.eventlog, st = ph.elState();
-        if (st.view == 'live') ph.elRequestLive(null);
-        else ph.elLoadHistory(true);
+        ph.elRequestLive(null);
         return false;
     };
     obj.elTogglePause = function() {
@@ -1400,117 +1340,6 @@ body.night #pluginEventLog {
         return false;
     };
 
-    // ---- history data ----
-    obj.elLoadHistory = function(reset) {
-        var ph = pluginHandler.eventlog, st = ph.elState();
-        if (!ph.elCan('history')) return false;
-        if (typeof currentNode == 'undefined' || currentNode == null) return false;
-        if (reset) { st.hist.skip = 0; }
-        st.hist.loading = true;
-        var ranges = { '1h': 3600e3, '24h': 86400e3, '7d': 7 * 86400e3, '30d': 30 * 86400e3 };
-        var since = ranges[st.range] ? (Date.now() - ranges[st.range]) : null;
-        var msg = { action: 'plugin', plugin: 'eventlog', pluginaction: 'getNodeHistory', nodeid: currentNode._id, meshid: currentNode.meshid, limit: st.show, skip: st.hist.skip, since: since };
-        // push the tab's filters into the server query so they cover all stored events, not just the loaded page
-        var f = st.filters;
-        if (f.levels != null) msg.levels = Object.keys(f.levels).map(Number);
-        if (f.logs != null) msg.logs = Object.keys(f.logs);
-        if (f.sources != null) msg.sources = Object.keys(f.sources);
-        if (String(f.text || '').trim() != '') msg.text = String(f.text).trim();
-        if (String(f.ids || '').trim() != '') msg.ids = String(f.ids).trim();
-        meshserver.send(msg);
-        ph.elRenderStatus();
-        return false;
-    };
-    // History filters run on the SERVER (the tab only holds one page): any filter change re-queries, debounced.
-    obj.elHistRefilter = function() {
-        var ph = pluginHandler.eventlog, st = ph.elState();
-        if (st.view != 'history') return false;
-        if (st._refilterT) clearTimeout(st._refilterT);
-        st._refilterT = setTimeout(function() { pluginHandler.eventlog.elLoadHistory(true); }, 250);
-        return false;
-    };
-    // counts for chips/facets/dropdowns: in History the server reports range-wide counts
-    // (the loaded page is only a slice); Live counts come from the loaded events.
-    obj.elCounts = function(fr) {
-        var st = pluginHandler.eventlog.elState();
-        if (st.view == 'history' && st.hist.facets) return st.hist.facets;
-        return fr.counts;
-    };
-    // With "Fold repeats" on, a page of N raw events can collapse into far fewer rows.
-    // Keep fetching further pages until ~N folded rows are visible (bounded at 5000 loaded events).
-    obj.elHistAutoFill = function() {
-        var ph = pluginHandler.eventlog, st = ph.elState();
-        if (st.view != 'history' || !st.fold || st.hist.loading) return false;
-        if (st.hist.events.length >= st.hist.total || st.hist.events.length >= 5000) return false;
-        var folded = ph.elFold(ph.elFiltered().rows).length;
-        if (folded >= st.show) return false;
-        st.hist.skip = st.hist.events.length;
-        ph.elLoadHistory(false);
-        return true;
-    };
-    obj.elLoadMore = function() {
-        var ph = pluginHandler.eventlog, st = ph.elState();
-        st.hist.skip = st.hist.events.length;
-        ph.elLoadHistory(false);
-        return false;
-    };
-    obj.elCollectNow = function() {
-        var ph = pluginHandler.eventlog, st = ph.elState();
-        if (!ph.elCan('history')) return false;
-        if (typeof currentNode == 'undefined' || currentNode == null) return false;
-        st.collectMsg = 'Requesting collection&hellip;';
-        meshserver.send({ action: 'plugin', plugin: 'eventlog', pluginaction: 'collectNow', nodeid: currentNode._id, meshid: currentNode.meshid });
-        ph.elRenderStatus();
-        return false;
-    };
-    obj.onCollectNow = function(server, message) {
-        var ph = pluginHandler.eventlog, st = ph.elState();
-        if (message.ok) {
-            st.collectMsg = 'Collection requested &mdash; reloading shortly&hellip;';
-            setTimeout(function() { var s = pluginHandler.eventlog.elState(); if (s.view == 'history') pluginHandler.eventlog.elLoadHistory(true); }, 7000);
-            setTimeout(function() { var s = pluginHandler.eventlog.elState(); s.collectMsg = null; if (s.view == 'history') pluginHandler.eventlog.elLoadHistory(true); }, 20000);
-        } else {
-            st.collectMsg = 'Device is not connected &mdash; collection runs when the agent is back online.';
-        }
-        ph.elRenderStatus();
-    };
-    obj.onLoadHistory = function(server, message) {
-        var ph = pluginHandler.eventlog;
-        if (!ph.elIsSupported()) return;
-        // a reply for the previous device can still arrive after the user has switched away
-        if ((message.nodeid != null) && (typeof currentNode != 'undefined') && (currentNode != null) && (message.nodeid != currentNode._id)) return;
-        if (!ph.elEnsureShell()) return;
-        var st = ph.elState();
-        st.hist.loading = false; st.hist.loaded = true;
-        if (message.meta) st.meta = message.meta;
-        if (message.facets) st.hist.facets = message.facets;
-        if (message.config) {
-            st.cfg = message.config;   // the node's resolved config set (live category/source rules)
-            st.hist.enabled = (message.config.historyEnabled !== false);
-            if (message.config.retentionDays) st.hist.retentionDays = message.config.retentionDays;
-        }
-        st.hist.total = (message.total != null) ? message.total : (message.events ? message.events.length : 0);
-        if (message.stored != null) st.hist.stored = message.stored;
-        if (message.lastCollected != null) {
-            var lc = message.lastCollected;
-            st.hist.lastCollected = (typeof lc == 'string' || typeof lc == 'object') ? new Date(lc).getTime() : Number(lc);
-        }
-        var evs = message.events || [];
-        if (!message.skip) st.hist.events = [];
-        var prevCount = st.hist.events.length;
-        for (var i in evs) {
-            var n = ph.elNormalize(evs[i]);
-            if (n == null) continue;
-            ph.byKey[n.key] = n;
-            var dup = false;
-            if (message.skip) { for (var j in st.hist.events) { if (st.hist.events[j].key == n.key) { dup = true; break; } } }
-            if (!dup) st.hist.events.push(n);
-        }
-        ph.elUpdate();
-        // only continue auto-filling folded pages while responses actually add events (loop guard)
-        if (st.hist.events.length > prevCount) ph.elHistAutoFill();
-    };
-
     // ---- plumbing (tunnel to the agent) ----
 
     // called when a new plugin message is received on the front end
@@ -1524,6 +1353,7 @@ body.night #pluginEventLog {
       if (!ph.elEnsureShell()) return;
       var st = ph.elState();
       if (data.caps) st.meta = { os: data.os || st.os, caps: data.caps };
+      if (data.cfg) st.cfg = data.cfg;   // the config set the agent holds (live category / source rules)
       var evs = data.data;
       if (evs == null) return;
       if (!Array.isArray(evs)) evs = [evs];
@@ -1623,8 +1453,6 @@ body.night #pluginEventLog {
             }
             ph.livelog.Start(ph.livelognode._id);
         }
-        var st = ph.elState();
-        if (!st.hist.loaded && !st.hist.loading) ph.elLoadHistory(true);   // first page of stored events
     };
 
     // Switching between plugin tabs does not go through gotoDevice(), so hook the switcher once.
@@ -1709,159 +1537,9 @@ body.night #pluginEventLog {
         .catch((e) => console.log('EVENTLOG: could not send the config to ' + myparent.dbNodeKey + ': ' + (e.message || e)));
     };
 
-    // Repair UTF-8 text that the agent decoded as Latin-1 (the PowerShell output file is UTF-8).
-    obj.fixText = function(v) {
-        if (typeof v != 'string' || !/[\u00C2-\u00F4][\u0080-\u00BF]/.test(v)) return v;
-        try { return Buffer.from(v, 'latin1').toString('utf8'); } catch (e) { return v; }
-    };
-    obj.fixEvents = function(events) {
-        var list = Array.isArray(events) ? events : [events];
-        list.forEach(function(e) { if (e && typeof e == 'object') { e.Message = obj.fixText(e.Message); e.ProviderName = obj.fixText(e.ProviderName); e.LogName = obj.fixText(e.LogName); if (e.Unit != null) e.Unit = obj.fixText(e.Unit); } });
-        return events;
-    };
-
-    // The node's resolved config set, cached per node. `uid` is the config version the agent holds;
-    // a different uid (config saved in the admin page) or a 10-minute age refreshes it. Never rejects.
-    obj.nodeConfig = function(nodeid, meshid, uid) {
-        var c = obj._cfgCache[nodeid], now = Date.now();
-        if (c != null && (uid == null || c.uid == uid) && (now - c.t) < 600000) return Promise.resolve(c.cfg);
-        return obj.db.getConfigFor(nodeid, meshid)
-        .then(function (cfg) { obj._cfgCache[nodeid] = { uid: (cfg != null) ? cfg.uid : uid, cfg: cfg, t: now }; return cfg; })
-        .catch(function (e) { console.log('EVENTLOG: config lookup failed for ' + nodeid + ': ' + (e.message || e)); return (c != null) ? c.cfg : null; });
-    };
-
     // True when the session belongs to a MeshCentral administrator (same test as the admin page itself, admin.js)
     obj.isPluginAdmin = function(myparent) {
         try { return (myparent != null && myparent.user != null && (myparent.user.siteadmin & 0xFFFFFFFF) != 0); } catch (e) { return false; }
-    };
-
-    // Config set History rules, applied to a batch as it arrives. Categories only mean something for
-    // journald (on Windows LogName is the event log, which historyLogs already selects); sources
-    // apply everywhere. Returns the events to store.
-    obj.applyCollectionFilters = function(events, cfg, os) {
-        if (cfg == null) return events;
-        var cats = (os == 'linux') ? obj.elRules(cfg.historyCategories, cfg.historyCategoriesMode) : null;
-        var srcs = obj.elRules(cfg.historySources, cfg.historySourcesMode);
-        if (cats == null && srcs == null) return events;
-        return events.filter(function (e) { return e != null && obj.elAllowed(cats, e.LogName) && obj.elAllowed(srcs, e.ProviderName); });
-    };
-
-    // ---- Alerts -------------------------------------------------------------------------------
-    // Alert rules live in the config set (cfg.alerts), so they follow the same node / mesh
-    // assignment as the collection rules. They are evaluated on the server against every batch as
-    // it arrives - before the History include/exclude rules, so an event that is not stored can
-    // still raise an alert. A firing rule dispatches a MeshCentral device event (etype 'node',
-    // action 'eventlogalert'), which is stored in the device's Events list.
-    obj.ALERT_MAX_EVENT_AGE_MS = 60 * 60 * 1000; // ignore events older than this: a fresh agent sends up to 24 h of backlog
-    obj._alertHits = {};   // nodeid|ruleid -> [arrival ms, ...] of matches inside the rule's window
-    obj._alertFired = {};  // nodeid|ruleid -> ms of the last alert (cooldown)
-
-    // "1112, 100-199" -> matcher(value), or null when empty
-    obj.alertIdMatcher = function(str) {
-        var singles = {}, ranges = [], any = false;
-        String(str == null ? '' : str).split(',').forEach(function (part) {
-            part = part.trim(); if (part == '') return;
-            var m = part.match(/^(\d+)\s*-\s*(\d+)$/);
-            if (m) { var a = Number(m[1]), b = Number(m[2]); if (b >= a) { ranges.push([a, b]); any = true; } }
-            else if (/^\d+$/.test(part)) { singles[String(Number(part))] = true; any = true; }
-        });
-        if (!any) return null;
-        return function (id) {
-            if (id == null || !/^\d+$/.test(String(id))) return false;
-            var n = Number(id);
-            if (singles[String(n)]) return true;
-            for (var i = 0; i < ranges.length; i++) { if (n >= ranges[i][0] && n <= ranges[i][1]) return true; }
-            return false;
-        };
-    };
-
-    // compile one rule's filters once per batch. Empty filters match everything.
-    obj.alertCompile = function(rule) {
-        var levels = Array.isArray(rule.levels) ? rule.levels.map(Number).filter(function (n) { return !isNaN(n); }) : [];
-        var text = (typeof rule.text == 'string' && rule.text.trim() != '') ? rule.text.trim().substring(0, 256).toLowerCase() : null;
-        return {
-            levels: levels.length ? levels : null,
-            logs: obj.elRules(rule.logs, 'include'),
-            sources: obj.elRules(rule.sources, 'include'),
-            ids: obj.alertIdMatcher(rule.ids),
-            text: text
-        };
-    };
-    obj.alertMatches = function(c, e) {
-        if (e == null || typeof e != 'object') return false;
-        if (c.levels != null && c.levels.indexOf(Number(e.Level)) == -1) return false;
-        if (!obj.elAllowed(c.logs, e.LogName)) return false;
-        if (!obj.elAllowed(c.sources, e.ProviderName)) return false;
-        if (c.ids != null && !c.ids(e.Id)) return false;
-        if (c.text != null && String(e.Message == null ? '' : e.Message).toLowerCase().indexOf(c.text) == -1) return false;
-        return true;
-    };
-    obj.alertEventTime = function(e) { // ms since epoch of the event, 0 when unknown
-        var v = Array.isArray(e.TimeCreated) ? e.TimeCreated[0] : e.TimeCreated;
-        var m = String(v).match(/\d+/);
-        return m ? Number(m[0]) : 0;
-    };
-
-    // Evaluate the node's alert rules against a freshly received batch. Never throws.
-    obj.evaluateAlerts = function(myparent, cfg, batch) {
-        try {
-            if (cfg == null || !Array.isArray(cfg.alerts) || cfg.alerts.length == 0 || !Array.isArray(batch)) return;
-            var now = Date.now(), nodeid = myparent.dbNodeKey;
-            var fresh = batch.filter(function (e) { // only recent events can alert
-                if (e == null || typeof e != 'object') return false;
-                var t = obj.alertEventTime(e);
-                return (t == 0) || ((now - t) <= obj.ALERT_MAX_EVENT_AGE_MS);
-            });
-            if (fresh.length == 0) return;
-            cfg.alerts.slice(0, 50).forEach(function (rule, idx) {
-                if (rule == null || typeof rule != 'object' || rule.enabled === false) return;
-                var c = obj.alertCompile(rule);
-                var matches = fresh.filter(function (e) { return obj.alertMatches(c, e); });
-                if (matches.length == 0) return;
-                var key = nodeid + '|' + String(rule.id || ('r' + idx));
-                var threshold = Math.floor(Number(rule.threshold)); if (!(threshold >= 1)) threshold = 1;
-                var windowMin = Number(rule.windowMin); if (!(windowMin >= 1)) windowMin = 10;
-                var cooldownMin = Number(rule.cooldownMin); if (isNaN(cooldownMin) || cooldownMin < 0) cooldownMin = 5;
-                var hits = (obj._alertHits[key] || []).filter(function (t) { return (now - t) < windowMin * 60000; });
-                for (var i = 0; i < matches.length; i++) hits.push(now);
-                if (hits.length > 1000) hits = hits.slice(-1000);
-                obj._alertHits[key] = hits;
-                if (hits.length < threshold) return;
-                var last = obj._alertFired[key];
-                if (last != null && (now - last) < cooldownMin * 60000) return;
-                obj._alertFired[key] = now;
-                obj._alertHits[key] = [];
-                obj.dispatchAlert(myparent, rule, matches, hits.length, windowMin, threshold);
-            });
-        } catch (e) { console.log('EVENTLOG: alert evaluation error: ' + (e.message || e)); }
-    };
-
-    obj.dispatchAlert = function(myparent, rule, matches, total, windowMin, threshold) {
-        try {
-            var last = matches[matches.length - 1];
-            var oneLine = function (s, n) { s = String(s == null ? '' : s).replace(/\s+/g, ' ').trim(); return (s.length > n) ? s.substring(0, n - 3) + '...' : s; };
-            var name = oneLine(rule.name || 'Unnamed rule', 80);
-            var msg = 'Event Log alert "' + name + '": ';
-            msg += (threshold > 1) ? (total + ' matching events within ' + windowMin + ' min') : 'matching event';
-            msg += ' - latest [' + oneLine(last.LogName, 40) + ' / ' + oneLine(last.ProviderName, 60) + ((last.Id != null && last.Id !== '') ? ' / ' + oneLine(last.Id, 20) : '') + '] ' + oneLine(last.Message, 200);
-            var event = {
-                etype: 'node', action: 'eventlogalert',
-                nodeid: myparent.dbNodeKey, meshid: myparent.dbMeshKey, domain: myparent.domain.id,
-                msg: msg, rule: name, count: total
-            };
-            obj.meshServer.DispatchEvent(['*', myparent.dbMeshKey, myparent.dbNodeKey], myparent, event);
-        } catch (e) { console.log('EVENTLOG: could not dispatch the alert event: ' + (e.message || e)); }
-    };
-
-    // send a message to a connected agent, if possible. Returns true when sent.
-    obj.sendToAgent = function(webserver, nodeid, message) {
-        try {
-            if (webserver == null || webserver.wsagents == null) return false;
-            var agent = webserver.wsagents[nodeid];
-            if (agent == null) return false;
-            agent.send(JSON.stringify(message));
-            return true;
-        } catch (e) { return false; }
     };
 
     // data was sent to server from the client. do something with it.
@@ -1904,17 +1582,6 @@ body.night #pluginEventLog {
         .catch((e) => console.log('EVENTLOG: could not refresh the endpoint config: ' + (e.message || e)));
       }
 
-      // For user-initiated actions, make sure the user has rights to the node.
-      var userHasNodeRights = function() {
-          if (myparent.user == null) return true; // agent context, not a user session
-          try {
-              if (typeof grandparent.GetNodeRights == 'function') {
-                  return (grandparent.GetNodeRights(myparent.user, command.meshid, command.nodeid) != 0);
-              }
-          } catch (e) { }
-          return true; // older MeshCentral without GetNodeRights: keep previous behavior
-      };
-
       switch (command.pluginaction) {
         case 'sendlog': {
           command.method = 'fe_on_message';
@@ -1934,141 +1601,14 @@ body.night #pluginEventLog {
           }
           break;
         }
-        case 'gatherlogs': { // submit logs to server db
-            try {
-                if (typeof command.data != 'string' || command.data.length > 8 * 1024 * 1024) { console.log('EVENTLOG: gatherlogs payload rejected (missing or > 8MB)'); break; }
-                if (command.caps != null && typeof obj.meshServer.pluginHandler.eventlog_db.setNodeMeta == 'function') {
-                    // remember the endpoint's log capabilities (journald present/persistent, files, ...) for the UI.
-                    // Linux agents report this with every batch, i.e. once a minute per node, but it changes
-                    // almost never - only write when it actually differs from what we last stored.
-                    var meta = { os: command.os || null, caps: command.caps };
-                    var metaKey = JSON.stringify(meta);
-                    var metaNode = myparent.dbNodeKey;
-                    if (obj._lastMeta[metaNode] !== metaKey) {
-                        obj._lastMeta[metaNode] = metaKey;
-                        var mp = obj.meshServer.pluginHandler.eventlog_db.setNodeMeta(metaNode, meta);
-                        // drop the cache entry again if the write failed, or the endpoint's OS would
-                        // stay unknown until it changes (History would then apply the Windows log
-                        // filter to a Linux node and hide its Kernel/Auth categories)
-                        if (mp != null && typeof mp.catch == 'function') {
-                            mp.catch(function (e) {
-                                delete obj._lastMeta[metaNode];
-                                console.log('EVENTLOG: setNodeMeta error: ' + (e.message || e));
-                            });
-                        }
-                    }
-                }
-                var batch = obj.fixEvents(JSON.parse(command.data));
-                if (!Array.isArray(batch)) batch = [batch];
-                // The ack value is the newest event time of the batch AS RECEIVED - before the config
-                // set's include/exclude rules drop anything - so the agent moves past dropped events too.
-                // (Reading the node's newest stored event instead meant a sort over everything that node
-                // had ever collected, once per node per minute.)
-                var batchMaxTc = 0;
-                batch.forEach(function (e) { var m = (e != null) ? String(e.TimeCreated).match(/\d+/) : null; if (m && Number(m[0]) > batchMaxTc) batchMaxTc = Number(m[0]); });
-                obj.nodeConfig(myparent.dbNodeKey, myparent.dbMeshKey, command.uid)
-                .then(function (cfg) {
-                    obj.evaluateAlerts(myparent, cfg, batch);   // before the History rules drop anything
-                    return obj.meshServer.pluginHandler.eventlog_db.addEventsFor(myparent.dbNodeKey, obj.applyCollectionFilters(batch, cfg, command.os));
-                })
-                .then(function (res) {
-                    if (res == null || !(batchMaxTc > 0)) return; // nothing received: leave the agent's position alone
-                    res = { count: res.count, maxTc: batchMaxTc };
-                    // Two collection runs can be in flight at once (a "Collect now" while the agent's
-                    // one-minute timer run is still going). If the older batch's acknowledgement were
-                    // to land last, the agent would rewind its position - or its journal cursor - and
-                    // re-send events that are already stored, duplicating them. Never acknowledge a
-                    // position earlier than one already sent for this node. An equal position is still
-                    // acknowledged, so a lost ack is simply repeated rather than stalling collection.
-                    var prevAck = obj._lastAck[myparent.dbNodeKey];
-                    if (prevAck != null && res.maxTc < prevAck) return;
-                    obj._lastAck[myparent.dbNodeKey] = res.maxTc;
-                    // send a message to the endpoint verifying receipt
-                    var ack = {
-                        action: 'plugin',
-                        pluginaction: 'setLVDOC',
-                        plugin: 'eventlog',
-                        nodeid: myparent.dbNodeKey,
-                        rights: true,
-                        sessionid: true,
-                        value: String(res.maxTc)    // ms since epoch, as the agent expects
-                    };
-                    if (command.os == 'linux' && command.cursor != null) ack.cursor = command.cursor; // echo: the agent commits this journal cursor
-                    myparent.send(JSON.stringify(ack));
-                })
-                .catch(function (e) { console.log('EVENTLOG: error storing collected events: ' + e); });
-              } catch (e) { console.log('Error gathering logs: ', e.stack); }
-            break;
-        }
-        case 'getNodeHistory': {
-            try {
-                if (!userHasNodeRights()) break;
-                // make sure the agent-side module is loaded so the periodic collector runs
-                obj.sendToAgent(grandparent, command.nodeid, { action: 'plugin', plugin: 'eventlog', pluginaction: 'serviceCheck', nodeid: command.nodeid, rights: true, sessionid: true });
-                var q = {
-                    limit: Math.min(Math.max(Number(command.limit) || 250, 1), 1000),
-                    skip: Math.max(Number(command.skip) || 0, 0),
-                    since: (command.since != null) ? Number(command.since) : null,
-                    // user filters from the tab; sanitized in the db layer (normParams)
-                    levels: command.levels, logs: command.logs, sources: command.sources,
-                    text: command.text, ids: command.ids
-                };
-                var withMeta = function(meta) {
-                  obj.db.getConfigFor(command.nodeid, command.meshid)
-                  .catch(function (e) { console.log('EVENTLOG: getNodeHistory config lookup failed: ' + (e.message || e)); return null; })
-                  .then((cfg) => {
-                    var opts = cfg || {};
-                    if (meta && meta.os == 'linux' && opts.historyLogs != null) {
-                        // the config's historyLogs are Windows log names; on Linux they would hide
-                        // stored categories (Kernel, Auth, ...) from the query
-                        opts = Object.assign({}, opts); delete opts.historyLogs;
-                    }
-                    obj.db.getEventsFor(command.nodeid, opts, q, function(events, total) {
-                      // stored/lastCollected describe the node as a whole, not the page: only the first
-                      // page needs them (the tab keeps the previous values for paged loads).
-                      var withStats = function(stats) {
-                        obj.db.getFacetsFor(command.nodeid, q.since, function(facets) {
-                            if (myobj.parent.ws == null) return;
-                            var msg = {
-                                action: 'plugin', plugin: 'eventlog', method: 'onLoadHistory',
-                                nodeid: command.nodeid,      // the tab drops replies for a device it has moved away from
-                                events: events || [], total: total || 0, skip: q.skip,
-                                config: cfg, meta: meta || null, facets: facets || null
-                            };
-                            if (stats != null) { msg.stored = stats.count; msg.lastCollected = stats.last; }
-                            myobj.parent.ws.send(JSON.stringify(msg));
-                        });
-                      };
-                      if (q.skip == 0) obj.db.getStatsFor(command.nodeid, withStats); else withStats(null);
-                    });
-                  });
-                };
-                if (typeof obj.db.getNodeMeta == 'function') obj.db.getNodeMeta(command.nodeid, withMeta); else withMeta(null);
-            } catch (e) { console.log('PLUGIN: eventlog: getNodeHistory error: ', e); }
-          break;
-        }
-        case 'collectNow': {
-            try {
-                if (!userHasNodeRights()) break;
-                var ok = obj.sendToAgent(grandparent, command.nodeid, { action: 'plugin', plugin: 'eventlog', pluginaction: 'collectnow', nodeid: command.nodeid, rights: true, sessionid: true });
-                if (myobj.parent.ws != null) {
-                    myobj.parent.ws.send(JSON.stringify({ action: 'plugin', plugin: 'eventlog', method: 'onCollectNow', ok: ok }));
-                }
-            } catch (e) { console.log('PLUGIN: eventlog: collectNow error: ', e); }
-            break;
-        }
         case 'adminSaveConfig': {
             // Every outcome is reported back to the admin page, so it can show whether the save worked.
             var sendAdmin = function(o) { try { o.action = 'plugin'; o.plugin = 'eventlog'; myobj.parent.ws.send(JSON.stringify(o)); } catch (e) { } };
             if (!obj.isPluginAdmin(myparent)) { sendAdmin({ method: 'adminSaveFailed', error: 'Administrator rights are required to change the configuration.' }); break; }
-            obj._cfgCache = {};   // ingest filters pick up the change with the next batch
             var opts = {...command.opts, ...{}};
             var isDefault = (command.id == '_default');
             var saved = isDefault
-                ? obj.db.updateDefaultConfig(opts).then(function () {
-                    if (opts.retentionDays != null && typeof obj.db.setRetention == 'function') obj.db.setRetention(opts.retentionDays);
-                    return '';
-                  })
+                ? obj.db.updateDefaultConfig(opts).then(function () { return ''; })
                 : obj.db.updateConfig(command.id, opts).then(function (d) { return (d != null && d.insertedId) || command.id; });
             saved
             .then(function (savedId) {
@@ -2084,7 +1624,6 @@ body.night #pluginEventLog {
         }
         case 'adminDeleteConfig': {
             if (!obj.isPluginAdmin(myparent)) break;
-            obj._cfgCache = {};
             obj.db.deleteConfigSet(command.id)
             .then((d) => {
               var x = { action: "plugin", plugin: "eventlog", method: "adminConfigDeleted", id: command.id };
@@ -2095,7 +1634,6 @@ body.night #pluginEventLog {
         }
         case 'adminAssignConfig': { // configId, nodes, meshes
             if (!obj.isPluginAdmin(myparent)) break;
-            obj._cfgCache = {};
             obj.db.assignConfig(command.configId, command.selection)
             .then(obj.db.getConfigAssignments)
             .then((d) => {

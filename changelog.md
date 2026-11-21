@@ -6,7 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Known Issues]
 - None. Please feel free to submit an issue via [GitHub](https://github.com/ryanblenis/MeshCentral-EventLog) if you find anything.
 
-## [0.1.14] - 2026-11-14
+## [2.0.0] - 2026-11-21
+### Changed
+- **The plugin is now live-only. No events are stored in any database.** The Event Log tab reads the logs straight from the device through MeshCentral's relay tunnel, only while the tab is on screen. Nothing is collected in the background any more
+- The agent no longer runs the once-a-minute collector, keeps no collection position, and ignores *collect now*. Linux and Windows live queries are unchanged
+- The plugin database layer (`db.js`, `db_sql.js`) now holds **only config sets and their node / mesh assignments**: MongoDB `plugin_eventlog_settings`, SQL table `plugin_eventlog_settings`, or NeDB `plugin-eventlog-settings.db`. No events, retention sweeps, per-device caps, node metadata or schema migrations remain
+- The browser gets the config set (live category / source rules) from the agent's live reply, so the tab no longer asks the server for it
+- The admin page now only has the **Live Config** section
+- Permissions: only *Event Log: Live Tab* is registered. *Event Log: History Tab* is gone
+### Removed
+- The History view, paged loading, range-wide facet counts, *Collect now*, and the last-collected / stored-total status
+- **Alerts.** They were evaluated on the server from the collected batches, so there is nothing left to evaluate. Alert rules already saved in a config set are ignored
+- History config (enabled, logs, categories, entry types, sources), *Retention (days)* and the 100,000-events-per-device cap
+- The server actions `getNodeHistory` and `collectNow`. An agent still running the old core that pushes `gatherlogs` batches is ignored by the server until its core reloads
+### Upgrade notes
+- Update the plugin, restart MeshCentral, then let agents pick up the new core (restart the agent or reinstall the plugin)
+- Events collected by earlier versions are **not deleted automatically**. Remove them yourself if you want the space back: MongoDB `db.plugin_eventlog.drop()`, SQL `DROP TABLE plugin_eventlog_events;`, NeDB delete `plugin-eventlog-events.db` from `meshcentral-data`. Take a backup first
+
+## [1.1.0] - 2026-11-14
 ### Added
 - **Alerts.** A config set can now hold alert rules. When incoming events match a rule, the plugin raises a MeshCentral device event (action `eventlogalert`), which is stored in the device's Events list
   - A rule can filter by Entry Type, Log, Source (`*` wildcards), Event IDs (`1112, 100-199`) and message text, and can require *N matching events within M minutes*. A per-device cooldown stops one noisy event from alerting repeatedly

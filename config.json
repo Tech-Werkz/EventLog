@@ -1,9 +1,9 @@
 {
   "name": "Event Log",
   "shortName": "eventlog",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "author": "Ryan Blenis",
-  "description": "An event log plugin to view, capture, and store event logs for each endpoint",
+  "description": "A live-only event log plugin to view the Windows event log or Linux journal of each endpoint (nothing is stored)",
   "hasAdminPanel": true,
   "homepage": "https://github.com/Tech-Werkz/EventLog",
   "changelogUrl": "https://raw.githubusercontent.com/Tech-Werkz/EventLog/master/changelog.md",
