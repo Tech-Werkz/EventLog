@@ -2,7 +2,7 @@
   "name": "Event Log",
   "shortName": "eventlog",
   "version": "2.0.0",
-  "author": "Ryan Blenis",
+  "author": "Ryan Blenis; fork by v3DJG6GL; Enhanced by Tech-Werkz",
   "description": "A live-only event log plugin to view the Windows event log or Linux journal of each endpoint (nothing is stored)",
   "hasAdminPanel": true,
   "homepage": "https://github.com/Tech-Werkz/EventLog",
@@ -14,5 +14,5 @@
     "url": "https://github.com/Tech-Werkz/EventLog.git"
   },
   "versionHistoryUrl": "https://api.github.com/repos/Tech-Werkz/EventLog/tags",
-  "meshCentralCompat": ">=0.9.29"
+  "meshCentralCompat": ">=1.3.1"
 }
